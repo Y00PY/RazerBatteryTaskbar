@@ -1,5 +1,6 @@
 {
   "name": "razerbatterytaskbar",
+  "productName": "RazerBatteryTaskbar",
   "version": "1.0.7",
   "main": "src/main.js",
   "author": "Josef",
