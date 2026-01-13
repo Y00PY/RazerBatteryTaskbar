@@ -23,7 +23,6 @@ function registerAutoStart() {
     let exePath;
 
     if (isSquirrel) {
-      // falls die App über den Squirrel-Installer gestartet wurde
       const appFolder = path.dirname(process.execPath);
       exePath = `"${path.join(
         appFolder,
@@ -58,6 +57,7 @@ let batteryCheckInterval;
 let rootPath;
 let cachedDevice = null;
 let claimedInterface = null;
+let consecutiveErrors = 0; // 🔥 NEU: Fehler-Counter
 
 // --- Razer Products ---
 const RazerProducts = {
@@ -90,7 +90,7 @@ const RazerProducts = {
 // --- Helpers ---
 function getBatteryIconPath(val) {
   const pct = Math.max(0, Math.min(100, Math.round(Number(val))));
-  const iconName = Math.floor(pct / 10) * 10; // 0,10,20,...,100
+  const iconName = Math.floor(pct / 10) * 10;
   return `src/assets/battery_${iconName}.png`;
 }
 
@@ -104,28 +104,60 @@ function getMessage(transactionId) {
   return msg;
 }
 
-// --- Device Handling ---
-async function getOrOpenDevice() {
-  if (cachedDevice) return cachedDevice;
-
-  const customWebUSB = new WebUSB({
-    devicesFound: (devices) => devices.find((d) => RazerProducts[d.productId]),
-  });
-
-  const device = await customWebUSB.requestDevice({ filters: [{}] });
-  if (!device) throw new Error("No Razer device found");
-
-  await device.open();
-  if (device.configuration === null) await device.selectConfiguration(1);
-
-  const iface = device.configuration.interfaces[0].interfaceNumber;
-  await device.claimInterface(iface);
-
-  cachedDevice = device;
-  claimedInterface = iface;
-  return device;
+// 🔥 NEU: Device Cleanup
+async function cleanupDevice() {
+  try {
+    if (cachedDevice && claimedInterface != null) {
+      await cachedDevice.releaseInterface(claimedInterface).catch(() => {});
+    }
+    if (cachedDevice?.opened) {
+      await cachedDevice.close().catch(() => {});
+    }
+  } catch (err) {
+    console.error("⚠️ Error during device cleanup:", err);
+  } finally {
+    cachedDevice = null;
+    claimedInterface = null;
+  }
 }
 
+// 🔥 GEÄNDERT: Mit vollständigem Error Handling
+async function getOrOpenDevice() {
+  try {
+    if (cachedDevice) return cachedDevice;
+
+    const customWebUSB = new WebUSB({
+      devicesFound: (devices) =>
+        devices.find((d) => RazerProducts[d.productId]),
+    });
+
+    const device = await customWebUSB.requestDevice({ filters: [{}] });
+    if (!device) throw new Error("No Razer device found");
+
+    await device.open();
+    if (device.configuration === null) await device.selectConfiguration(1);
+
+    const iface = device.configuration.interfaces[0].interfaceNumber;
+    await device.claimInterface(iface);
+
+    cachedDevice = device;
+    claimedInterface = iface;
+
+    consecutiveErrors = 0; // 🔥 Reset error counter bei Erfolg
+    console.log(
+      "✅ Device successfully opened:",
+      RazerProducts[device.productId]?.name
+    );
+
+    return device;
+  } catch (err) {
+    console.error("❌ Error opening device:", err.message);
+    await cleanupDevice(); // 🔥 Cleanup bei Fehler
+    throw err;
+  }
+}
+
+// 🔥 GEÄNDERT: Mit robustem Error Handling
 async function readBattery() {
   try {
     const device = await getOrOpenDevice();
@@ -156,95 +188,189 @@ async function readBattery() {
       90
     );
 
-    if (!reply?.data || reply.data.byteLength < 10) return undefined;
+    if (!reply?.data || reply.data.byteLength < 10) {
+      console.warn("⚠️ Invalid battery response received");
+      return undefined;
+    }
+
     const raw = reply.data.getUint8(9);
-    return (raw / 255) * 100;
-  } catch {
+    const batteryPct = (raw / 255) * 100;
+
+    consecutiveErrors = 0; // 🔥 Reset bei erfolgreichem Read
+    return batteryPct;
+  } catch (err) {
+    consecutiveErrors++; // 🔥 Increment error counter
+    console.error(
+      `❌ Error reading battery (error #${consecutiveErrors}):`,
+      err.message
+    );
+
+    // 🔥 Bei mehreren Fehlern: Device-Cache invalidieren
+    if (consecutiveErrors >= 3) {
+      console.log("🔄 Too many errors, resetting device connection...");
+      await cleanupDevice();
+    }
+
     return undefined;
   }
 }
 
-// --- Tray Logic ---
+// 🔥 GEÄNDERT: Mit Try-Catch um gesamte Funktion
 async function setTrayDetails() {
-  const batt = await readBattery();
+  try {
+    const batt = await readBattery();
 
-  if (batt === undefined) {
-    tray.setImage(
-      nativeImage.createFromPath(
-        path.join(rootPath, "src/assets/battery_0.png")
-      )
-    );
-    tray.setToolTip("Device disconnected");
-    return;
+    if (batt === undefined) {
+      tray.setImage(
+        nativeImage.createFromPath(
+          path.join(rootPath, "src/assets/battery_0.png")
+        )
+      );
+      tray.setToolTip("Device disconnected");
+      return;
+    }
+
+    const pct = Math.round(batt);
+    const iconPath = getBatteryIconPath(pct);
+
+    let modelName = "Razer Device";
+    if (cachedDevice && RazerProducts[cachedDevice.productId]) {
+      modelName = RazerProducts[cachedDevice.productId].name
+        .replace(/Wireless|Wired/gi, "")
+        .trim();
+    }
+
+    tray.setImage(nativeImage.createFromPath(path.join(rootPath, iconPath)));
+    tray.setToolTip(`${modelName} – ${pct}%`);
+
+    console.log(`🔋 Battery updated: ${pct}%`);
+  } catch (err) {
+    // 🔥 NEU: Catch für gesamte Tray-Update-Funktion
+    console.error("❌ Critical error in setTrayDetails:", err);
+
+    try {
+      tray.setImage(
+        nativeImage.createFromPath(
+          path.join(rootPath, "src/assets/battery_0.png")
+        )
+      );
+      tray.setToolTip("Error - retrying...");
+    } catch (trayErr) {
+      console.error("❌ Failed to update tray icon:", trayErr);
+    }
+
+    // 🔥 Bei kritischem Fehler: Device neu initialisieren
+    await cleanupDevice();
   }
-
-  const pct = Math.round(batt);
-  const iconPath = getBatteryIconPath(pct);
-
-  let modelName = "Razer Device";
-  if (cachedDevice && RazerProducts[cachedDevice.productId]) {
-    modelName = RazerProducts[cachedDevice.productId].name
-      .replace(/Wireless|Wired/gi, "")
-      .trim();
-  }
-
-  tray.setImage(nativeImage.createFromPath(path.join(rootPath, iconPath)));
-  tray.setToolTip(`${modelName} – ${pct}%`);
 }
 
 // --- Quit Handler ---
 function quitClick() {
   clearInterval(batteryCheckInterval);
-  try {
-    if (cachedDevice && claimedInterface != null)
-      cachedDevice.releaseInterface(claimedInterface).catch(() => {});
-    if (cachedDevice?.opened) cachedDevice.close().catch(() => {});
-  } catch {}
-  if (process.platform !== "darwin") app.quit();
+  cleanupDevice().then(() => {
+    if (process.platform !== "darwin") app.quit();
+  });
 }
+
+// 🔥 GEÄNDERT: Robuster Resume Handler
+powerMonitor.on("resume", async () => {
+  console.log("💡 System resumed from sleep – refreshing battery status");
+
+  try {
+    // 🔥 Immer Device-Cache invalidieren nach Resume
+    await cleanupDevice();
+    consecutiveErrors = 0;
+
+    // 🔥 Erst 3 Sekunden warten, bis USB enumeriert ist
+    setTimeout(() => {
+      let retries = 0;
+      const tryRefresh = setInterval(async () => {
+        try {
+          retries++;
+          console.log(`🔄 Resume retry attempt ${retries}/10...`);
+
+          const batt = await readBattery();
+
+          if (batt !== undefined && batt > 0) {
+            console.log(
+              `✅ Battery detected after resume: ${Math.round(batt)}%`
+            );
+            await setTrayDetails();
+            clearInterval(tryRefresh);
+          } else if (retries >= 10) {
+            console.log("❌ No device detected after resume (timeout)");
+            clearInterval(tryRefresh);
+            // 🔥 Auch bei Timeout: Clean state
+            await cleanupDevice();
+          }
+        } catch (err) {
+          console.error(
+            `❌ Error during resume retry ${retries}:`,
+            err.message
+          );
+
+          if (retries >= 10) {
+            console.log("❌ Max retries reached, stopping...");
+            clearInterval(tryRefresh);
+            await cleanupDevice();
+          }
+        }
+      }, 3000);
+    }, 3000);
+  } catch (err) {
+    console.error("❌ Critical error in resume handler:", err);
+  }
+});
 
 // --- App Lifecycle ---
 app.whenReady().then(() => {
-  rootPath = app.getAppPath();
+  try {
+    rootPath = app.getAppPath();
 
-  const icon = nativeImage.createFromPath(
-    path.join(rootPath, "src/assets/battery_0.png")
-  );
-  tray = new Tray(icon);
+    const icon = nativeImage.createFromPath(
+      path.join(rootPath, "src/assets/battery_0.png")
+    );
+    tray = new Tray(icon);
 
-  const contextMenu = Menu.buildFromTemplate([
-    { label: "Quit", type: "normal", click: quitClick },
-  ]);
-  tray.setContextMenu(contextMenu);
-  tray.setToolTip("Checking battery... (10s)");
-  // ⏳ 10 Sekunden Delay, bevor wir fetchen, wegen pc start zb
-  setTimeout(() => {
-    setTrayDetails();
-    batteryCheckInterval = setInterval(setTrayDetails, 30000);
-  }, 10000);
+    const contextMenu = Menu.buildFromTemplate([
+      { label: "Quit", type: "normal", click: quitClick },
+    ]);
+    tray.setContextMenu(contextMenu);
+    tray.setToolTip("Checking battery... (10s)");
 
-  registerAutoStart();
+    // 🔥 10 Sekunden Delay mit Error Handling
+    setTimeout(async () => {
+      try {
+        await setTrayDetails();
+
+        // 🔥 GEÄNDERT: Interval mit Error Handling
+        batteryCheckInterval = setInterval(async () => {
+          try {
+            await setTrayDetails();
+          } catch (err) {
+            console.error("❌ Error in battery check interval:", err);
+          }
+        }, 10000);
+      } catch (err) {
+        console.error("❌ Error during initial battery check:", err);
+      }
+    }, 10000);
+
+    registerAutoStart();
+  } catch (err) {
+    console.error("❌ Critical error during app initialization:", err);
+    app.quit();
+  }
 });
 
-powerMonitor.on("resume", () => {
-  console.log("💡 System resumed from sleep – refreshing battery status");
-  cachedDevice = null;
+// 🔥 NEU: Unhandled rejection handler
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("❌ Unhandled Promise Rejection:", reason);
+  cleanupDevice();
+});
 
-  // Erst 3 Sekunden warten, bis USB enumeriert ist
-  setTimeout(() => {
-    let retries = 0;
-    const tryRefresh = setInterval(async () => {
-      retries++;
-      const batt = await readBattery();
-
-      if (batt !== undefined && batt > 0) {
-        console.log(`🔋 Battery detected after resume: ${Math.round(batt)}%`);
-        setTrayDetails();
-        clearInterval(tryRefresh);
-      } else if (retries >= 6) {
-        console.log("❌ No device detected after resume (timeout)");
-        clearInterval(tryRefresh);
-      }
-    }, 3000);
-  }, 3000); // 🔥 erst 3 Sekunden nach Resume starten
+// 🔥 NEU: Uncaught exception handler
+process.on("uncaughtException", (err) => {
+  console.error("❌ Uncaught Exception:", err);
+  cleanupDevice();
 });
